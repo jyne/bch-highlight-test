@@ -1,0 +1,179 @@
+#!/usr/bin/env python
+import argparse
+import errno
+import logging
+import os
+import re
+import signal
+import sys
+
+import requests
+
+import ghtools.utils as utils
+from ghtools.WorkList import WorkList
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.INFO)
+
+def signal_handler(signal, frame):
+    os._exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+def do_rest_call(rest_service, parameters={}):
+    return do_url_call('https://api.github.com' + rest_service, parameters)
+
+def get_gh_token():
+    secret_file = os.path.join(os.path.expanduser("~"), ".github-secret")
+    if not os.path.isfile(secret_file):
+        print "Could not find .github-secret file in home directory!"
+        os._exit(1)
+    with open(secret_file, 'r') as f:
+        return f.readline().strip()
+
+def do_url_call(url, parameters={}):
+    result = requests.get(url, params=parameters,
+                          auth=(get_gh_token(), 'x-oauth-basic'))
+    return result
+
+def get_language_info(repo):
+    response = do_url_call(repo['languages_url'])
+    return response.json()
+
+def get_projects_data(response):
+    result = []
+    items = response.json()['items']
+    for repo in items:
+        project_data = {
+            'id': str(repo['id']),
+            'url': repo['html_url'],
+            'name': repo['name'],
+            'language': repo['language'],
+            'created_at': repo['created_at']
+        }
+        result.append(project_data)
+    return result
+
+def has_next_page(response):
+    pagination_links = response.headers['link']
+    if pagination_links is None:
+        return False
+    m = re.search('[<]([^>]+)[>]; rel="next"', pagination_links)
+    return m is not None
+
+def get_next_page_url(response):
+    pagination_links = response.headers['link']
+    m = re.search('[<]([^>]+)[>]; rel="next"', pagination_links)
+    return m.group(1)
+
+def get_last_page_number(response):
+    pagination_links = response.headers['link']
+    if pagination_links is None:
+        return 1
+    m = re.search('[<].*[?&]page=(\d+).*[>]; rel="last"', pagination_links)
+    return m.group(1)
+
+def show_results(worklist, args):
+    if args.outfile is not None:
+        worklist.write(args.outfile)
+        args.outfile.close()
+        logger.info("JSON output written to file: " + str(args.outfile.name))
+    else:
+        try:
+            worklist.write(sys.stdout)
+        except IOError as e:
+            if e.errno == errno.EPIPE:
+                logger.error('Could not write to stdout!')
+
+def do_query(query_opts, max):
+    response = do_rest_call('/search/repositories', query_opts)
+    sys.stderr.write('Pages in search result: ' +
+                     str(get_last_page_number(response)) + '\n')
+    sys.stderr.write('Please wait while retrieving page:')
+    result = get_projects_data(response)
+    page = 1
+    sys.stderr.write(' ' + str(page))
+    sys.stderr.flush()
+    while has_next_page(response) and len(result) < max:
+        page += 1
+        response = do_url_call(get_next_page_url(response))
+        result.extend(get_projects_data(response))
+        sys.stderr.write(' ' + str(page))
+        sys.stderr.flush()
+    result = result[0:max]
+    sys.stderr.write('\nTotal repositories: ' + str(len(result)) + '\n')
+    return result
+
+def get_unkown_languages(languages):
+    result = []
+    available_languages = utils.get_all_gh_languages()
+    for l in languages:
+        if not l in available_languages:
+            result.append(l)
+    return result
+
+epilog = """
+Examples:
+    1. Get the list of the most starred Java repositories:
+        $ gt-query -l java
+
+    2. Get the list of repositories that have the term "tetris":
+        $ gt-query tetris
+"""
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            description='Query the GitHub search API',
+            epilog=epilog)
+    parser.add_argument('query', nargs='?', metavar="query", default='',
+                        help="the search query")
+    parser.add_argument('-l', '--language', action='append')
+    parser.add_argument('--list-languages', action='store_true',
+                        help='List all GitHub language names that ' +
+                             'can be used in queries')
+    parser.add_argument('-n', '--number', help='Maximum number of repositories')
+    parser.add_argument('-o', '--outfile', type=argparse.FileType('w', 0),
+                        required=True, help="Write JSON output to this file")
+    args = parser.parse_args()
+
+    if args.list_languages:
+        langs = utils.get_all_gh_languages()
+        for l in langs:
+            print l
+        sys.exit()
+
+    if args.query == '' and args.language is None:
+        parser.print_help()
+        sys.exit(1)
+
+    query_opts = {'per_page': '100'}
+    if args.query != '':
+        query_opts['q'] = args.query + ' in:name,description'
+    else:
+        query_opts['sort'] = 'stars'
+    wl = WorkList()
+
+    if args.number is None:
+        max = 1000
+    else:
+        max = int(args.number)
+
+    if args.language is None:
+        projects = do_query(query_opts, max)
+
+        for p in projects:
+            wl.append(p)
+    else:
+        unknown_languages = get_unkown_languages(args.language)
+        if len(unknown_languages) > 0:
+            logger.error('Unknown languages: ' + ', '.join(unknown_languages))
+            sys.exit(1)
+        for l in args.language:
+            logger.info('Querying GitHub for language: ' + l)
+            query_opts['q'] = (args.query + ' language:' + l)
+            projects = do_query(query_opts, max)
+            for p in projects:
+                wl.append(p)
+    show_results(wl, args)
